@@ -4,7 +4,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from layer import MultiHeadAttention, PositionwiseFeedForward
+try: from layer import MultiHeadAttention, PositionwiseFeedForward
+except: from SSMCT.layer import MultiHeadAttention, PositionwiseFeedForward
 
 def get_non_pad_mask(seq):
     assert seq.dim() == 3

@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from mirrored_supModel.BABELdata import rotation_conversions as geometry
+
 
 def length(x, axis=-1, keepdims=True):
     """
@@ -101,6 +103,25 @@ def quat_fk(lrot, lpos, parents):
         gr.append(quat_mul(gr[parents[i]], lrot[..., i:i+1, :]))
 
     res = np.concatenate(gr, axis=-2), np.concatenate(gp, axis=-2)
+    return res
+
+def quat_fk_cuda(lrot, lpos, parents):
+    """
+    Performs Forward Kinematics (FK) on local quaternions and local positions to retrieve global representations
+    在局部位置和局部四元数上执行FK以求全局表示 全局位置和全局旋转
+    :param lrot: tensor of local quaternions with shape (..., Nb of joints, 4)  局部四元数 B, F, J, 4
+    :param lpos: tensor of local positions with shape (..., Nb of joints, 3)    局部位置  B, F, J, 3
+    :param parents: list of parents indices 每个关节的父关节的下标构成的列表
+    :return: tuple of tensors of global quaternion, global positions
+    """
+    gp, gr = [lpos[..., :1, :]], [lrot[..., :1, :]] # 根关节的局部位置和局部旋转 就是 全局位置和全局旋转
+    for i in range(1, len(parents)):
+        # gp.append(quat_mul_vec(gr[parents[i]], lpos[..., i:i+1, :]) + gp[parents[i]])   # quat_mul_vec
+        # gr.append(quat_mul(gr[parents[i]], lrot[..., i:i+1, :]))
+        gp.append(geometry.quaternion_apply(gr[parents[i]], lpos[..., i:i+1, :]) + gp[parents[i]])
+        gr.append(geometry.quaternion_multiply(gr[parents[i]], lrot[..., i:i+1, :]))
+
+    res = torch.cat(gr, dim=-2), torch.cat(gp, dim=-2)
     return res
 
 
