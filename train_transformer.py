@@ -65,6 +65,8 @@ def interpolation(X, Q, n_past=10, n_future=10, n_trans = 40):
     # Interpolation pos/quats
     x, q = curr_x, curr_q    # x: B,curr_window,J,3       q: B, curr_window, J, 4
     # inter_pos, inter_local_quats = interpolate_local(x.numpy(), q.numpy(), n_past, n_future)  # inter_pos: B, n_trans + 2, J, 3   inter_local_quats: B, n_trans + 2, J, 4
+    if isinstance(x, torch.Tensor): x = x.numpy()
+    if isinstance(q, torch.Tensor): q = q.numpy()
     inter_pos, inter_local_quats = interpolate_local(x, q, n_past, n_future)
 
     trans_inter_pos = inter_pos[:, 1:-1, :, :]    #  B, n_trans, J, 3  把头尾2帧去掉
@@ -95,13 +97,17 @@ def do_batch(batch_i, batch_data, mode):
         rotations = batch_data['local_q']
         global_p_gt = batch_data['X'].cuda()
         global_q_gt = batch_data['Q']
+
+        if opt['data']['mask'] == 'rand':
+            n_trans = np.random.randint(2, opt['model']['seq_length']-2)
+            n_past = (opt['model']['seq_length'] - n_trans) // 2
+            n_future = opt['model']['seq_length'] - n_past - n_trans
+        elif opt['data']['mask'] == 'static':
+            n_past, n_future, n_trans = opt['model']['n_past'], opt['model']['n_future'], opt['model']['n_trans']
+
         # 插值 求ground truth 和 插值结果
         # gt_pose numpy [B, F, dim] interp_pose numpy[B, F, dim]
-        gt_pose, interp_pose = interpolation(positions,
-                                                rotations,
-                                                n_past = opt['model']['n_past'],
-                                                n_future = opt['model']['n_future'],
-                                                n_trans = opt['model']['n_trans'])
+        gt_pose, interp_pose = interpolation(positions, rotations, n_past = n_past, n_future = n_future, n_trans = n_trans)
 
         # 数据放到GPU to_device
         gt_pose = gt_pose.astype(np.float32)
@@ -110,7 +116,7 @@ def do_batch(batch_i, batch_data, mode):
         target_output = torch.from_numpy(gt_pose).to(device)
 
         # Training
-        output = model(input)
+        output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
         if mode == 'train':
             optimizer.zero_grad()
 
@@ -169,8 +175,8 @@ def do_batch(batch_i, batch_data, mode):
 
         mean = x_mean_n if mode == 'train' else x_mean_n_vld
         std = x_std_n if mode == 'train' else x_std_n_vld
-        trans_global_p_pred = (global_p_pred[:,opt['model']['n_past']: opt['model']['n_past'] + opt['model']['n_trans'],...] - mean).detach().cpu().numpy() / std.detach().cpu().numpy()  # Normalization
-        trans_global_p_gt = (global_p_gt[:,opt['model']['n_past']: opt['model']['n_past'] + opt['model']['n_trans'],...] - mean).detach().cpu().numpy() / std.detach().cpu().numpy()
+        trans_global_p_pred = (global_p_pred[:, n_past:n_past+n_trans, ...] - mean).detach().cpu().numpy() / std.detach().cpu().numpy()  # Normalization
+        trans_global_p_gt = (global_p_gt[:, n_past:n_past+n_trans, ...] - mean).detach().cpu().numpy() / std.detach().cpu().numpy()
         l2p_error = np.mean(np.sqrt(np.sum((trans_global_p_pred - trans_global_p_gt) ** 2.0, axis=(2, 3))))
 
 
@@ -185,7 +191,7 @@ def do_batch(batch_i, batch_data, mode):
 
 if __name__ == '__main__':
     # ===========================================读取配置信息===============================================
-    opt = yaml.load(open('./config/train_config_BABEL.yaml', 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
+    opt = yaml.load(open('./config/train_config_BABEL_rm.yaml', 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
     # opt = yaml.load(open('./config/train_config_lafan.yaml', 'r').read())     # 用lafan数据集训练
     stamp = time.strftime("%Y-%m-%d-%H_%M_%S", time.localtime(time.time()))
     print(stamp)
@@ -199,14 +205,12 @@ if __name__ == '__main__':
 
     random.seed(opt['train']['seed'])
     torch.manual_seed(opt['train']['seed'])
-    if opt['train']['cuda']:
-        torch.cuda.manual_seed(opt['train']['seed'])
+    if opt['train']['cuda']: torch.cuda.manual_seed(opt['train']['seed'])
 
     # ===================================使用GPU==================================
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(torch.cuda.is_available())
     print(device)
-
 
     #==========================初始化Skel和数据========================================
     parents = BABELparents
@@ -259,7 +263,7 @@ if __name__ == '__main__':
     print(f"curr_window: {curr_window}")
     for epoch_i in range(1, opt['train']['num_epoch']+1):  # 每个epoch轮完一遍所有的训练数据
         model.train()
-        scheduler_warmup.step(epoch_i)
+        # scheduler_warmup.step(epoch_i)
         print("epoch: ",epoch_i, "lr: {:.10f} ".format(optimizer.param_groups[0]['lr']))
 
         # 每个batch训练一批数据
@@ -271,6 +275,7 @@ if __name__ == '__main__':
                 losses[key].append(val)
         
         RecordBatch(losses, 'train', epoch_i)
+        scheduler_warmup.step(epoch_i)
 
         if epoch_i % opt['train']['save_per_epochs'] == 0 or epoch_i == 1:
             #validate:
@@ -283,6 +288,7 @@ if __name__ == '__main__':
             
             checkpoint = {
                 'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
                 'epoch': epoch_i
             }
             filename = os.path.join(opt['train']['output_dir'], f'epoch_{epoch_i}.pt')

@@ -89,11 +89,15 @@ def do_batch(batch_i, batch_data, mode):
         global_p_gt = batch_data['X'].cuda()
         # 插值 求ground truth 和 插值结果
         # gt_pose numpy [B, F, dim] interp_pose numpy[B, F, dim]
-        gt_pose, interp_pose = interpolation(positions,
-                                                rotations,
-                                                n_past = opt['model']['n_past'],
-                                                n_future = opt['model']['n_future'],
-                                                n_trans = opt['model']['n_trans'])
+
+        if opt['data']['mask'] == 'rand':
+            n_trans = np.random.randint(2, opt['model']['seq_length']-2)
+            n_past = (opt['model']['seq_length'] - n_trans) // 2
+            n_future = opt['model']['seq_length'] - n_past - n_trans
+        elif opt['data']['mask'] == 'static':
+            n_past, n_future, n_trans = opt['model']['n_past'], opt['model']['n_future'], opt['model']['n_trans']
+
+        gt_pose, interp_pose = interpolation(positions, rotations, n_past = n_past, n_future = n_future, n_trans = n_trans)
 
         # 数据放到GPU to_device
         gt_pose = gt_pose.astype(np.float32)
@@ -102,7 +106,7 @@ def do_batch(batch_i, batch_data, mode):
         target_output = torch.from_numpy(gt_pose).to(device)
 
         # Training
-        output = model(input)
+        output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
         if mode == 'train':
             optimizer.zero_grad()
 
@@ -161,7 +165,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # ===========================================读取配置信息===============================================
-    opt = yaml.load(open('./config/test_config_BABEL.yaml', 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
+    opt = yaml.load(open('./config/test_config_BABEL_rm.yaml', 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
     # opt = yaml.load(open('./config/train_config_lafan.yaml', 'r').read())     # 用lafan数据集训练
     stamp = time.strftime("%Y-%m-%d-%H_%M_%S", time.localtime(time.time()))
     print(stamp)
@@ -173,10 +177,10 @@ if __name__ == '__main__':
     output_dir = opt['train']['output_dir']     # 模型输出路径
     if not os.path.exists(output_dir): os.mkdir(output_dir)
 
-    random.seed(opt['train']['seed'])
-    torch.manual_seed(opt['train']['seed'])
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
     if opt['train']['cuda']:
-        torch.cuda.manual_seed(opt['train']['seed'])
+        torch.cuda.manual_seed(args.seed)
 
     # ===================================使用GPU==================================
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')

@@ -152,13 +152,17 @@ class Encoder(nn.Module):
         # 输出卷积层
         self.outConv = nn.Conv1d(in_channels=d_model, out_channels=input_dim, kernel_size=3, padding=1)  # position-wise
 
-    def forward(self, src_seq, mask=None, return_attns=False):
+    def forward(self, src_seq, mask=None, return_attns=False, n_past=None, n_future=None, n_trans=None):
         '''
         :param src_seq: 原始序列，初始为输入的插值序列[B, F, dim]
         :param mask:
         :param return_attns:
         :return:
         '''
+        if n_past is None: n_past = self.n_past
+        if n_future is None: n_future = self.n_future
+        if n_trans is None: n_trans = self.n_trans
+
         enc_slf_attn_list = []
         # -- Forward
         # 输入卷积层
@@ -166,7 +170,7 @@ class Encoder(nn.Module):
         enc_input = self.inConv(src_seq)    # 输入卷积层 [B, F, d_model]
         enc_input = enc_input.permute(0, 2, 1)
         # 混合嵌入
-        enc_output = self.embedding(enc_input, n_past=self.n_past, n_future=self.n_future, n_trans=self.n_trans)
+        enc_output = self.embedding(enc_input, n_past=n_past, n_future=n_future, n_trans=n_trans)
         # 位置编码
         # enc_output = self.position_enc(enc_input)   # [B, F, d_model]
         # enc_output = enc_input + self.position_enc(src_seq) # 输入卷积层+位置编码

@@ -15,10 +15,10 @@ model:
 
 data:
     data_dir: '../../data/amass_30fps_train_AccadCMU.pt'
-    # vald_dir: './BABELdata/amass_30fps_vald_HumanEva.pt'
     vald_dir: '../../data/amass_30fps_vald_BMLmovi.pt'
     data_set: 'BABEL'
-    mask: 'static'
+    mask: 'rand'
+
     
     num_workers: 1
     offset: 20
@@ -42,8 +42,8 @@ train:
     debug: False
     cuda: True
     method: ''
-    log_dir: 'logs/train_BABEL'
-    output_dir: 'checkpoints/train_BABEL'
+    log_dir: 'logs/train_BABEL_rm'
+    output_dir: 'checkpoints/train_BABEL_rm'
 
     picture_name: 'train_loss'
 
