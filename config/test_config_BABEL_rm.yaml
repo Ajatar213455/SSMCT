@@ -34,8 +34,9 @@ train:
     loss_ik_weight: 0.01
     loss_quat_weight: 10
     loss_position_weight: 0.1
+    loss_KL_weight: 0.001
 
-    num_epoch: 1000
+    num_epoch: 1
     weight_decay: 0.75
 
     debug: False

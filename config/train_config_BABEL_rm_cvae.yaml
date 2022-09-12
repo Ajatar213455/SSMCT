@@ -35,7 +35,7 @@ train:
     loss_ik_weight: 0.01
     loss_quat_weight: 10
     loss_position_weight: 0.1
-    loss_KL_weight: 0
+    loss_KL_weight: 0.01
 
     num_epoch: 1000
     weight_decay: 0.75
@@ -43,11 +43,11 @@ train:
     debug: False
     cuda: True
     method: ''
-    log_dir: 'logs/train_BABEL_rm_smallData'
-    output_dir: 'checkpoints/train_BABEL_rm_smallData'
+    log_dir: 'logs/train_BABEL_rm_cvae_KL1e-2'
+    output_dir: 'checkpoints/train_BABEL_rm_cvae_KL1e-2'
 
     picture_name: 'train_loss'
 
 test:
     load_model: False
-    model_dir: './checkpoints/train_BABEL/epoch_510.pt'
+    model_dir: 'checkpoints/train_BABEL_rm_cvae/BestAmong_1000.pt'

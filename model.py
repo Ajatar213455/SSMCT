@@ -94,7 +94,7 @@ class Embedding(nn.Module):
         kf_index = kf_index.to(self.device)
         kf_index[n_past:n_past+n_trans] = 1
         if(n_position < seq_len):
-            kf_index[n_position:] = 2
+            kf_index[n_position:] = 2 # 2 for GT encoder
         embedding = x + self.pos_embed(pos_index) + self.kf_embed(kf_index)
         return self.norm(embedding)
 
@@ -130,6 +130,7 @@ class Encoder(nn.Module):
 
         super().__init__()
 
+        self.name = 'transformer'
         self.d_model = d_model
         self.n_past = n_past
         self.n_future = n_future
@@ -201,11 +202,13 @@ class Encoder_BiRNN(nn.Module):
     """
     def __init__(
             self, device, seq_len=60, input_dim=168,      # seq_len：帧数  每个数据的帧数，一个batch中所有数据均为固定长度帧数，如50帧，25帧，35帧  input_dim：输入模型的数据中每一帧的维度
+            n_layer=None, n_head=None, d_k=None, d_v=None,
             d_model=256, d_inner=256, dropout=0.1,  # d_model：卷积层的输出维度  d_inner：FFN隐藏层维度
             n_past = 15, n_future = 15, n_trans = 30, num_layers = 2):   # 已知的关键帧数量和未知帧数
 
         super().__init__()
 
+        self.name = 'birnn'
         self.device = device
         self.d_model = d_model
         self.n_past = n_past
@@ -262,5 +265,174 @@ class Encoder_BiRNN(nn.Module):
         enc_output = enc_output.permute(0, 2, 1)  # 注意卷积前后要转维度
         enc_output = self.outConv(enc_output)    # 输入卷积层 [B, input_dim, F]
         enc_output = enc_output.permute(0, 2, 1)
+
+        return enc_output
+
+class CVAE_Transformer_Encoder(nn.Module):
+    def __init__(
+            self, device, seq_len=50, input_dim=217,      # seq_len：帧数  每个数据的帧数，一个batch中所有数据均为固定长度帧数，如50帧，25帧，35帧  input_dim：输入模型的数据中每一帧的维度
+            n_layers=8, n_head=8, d_k=64, d_v=64,   # n_layers：编码器层数  n_head：多头注意力头数  d_k:注意力中矩阵Q，K的维度 d_v:注意力中矩阵V的维度
+            d_model=256, d_inner=512, dropout=0.1,  # d_model：卷积层的输出维度  d_inner：FFN隐藏层维度
+            n_past =10, n_future = 10, n_trans = 30):   # 已知的关键帧数量和未知帧数
+
+        super().__init__()
+
+        self.d_model = d_model
+        self.n_past = 0
+        self.n_future = 0
+        self.n_trans = 0
+
+        # 输入卷积层
+        self.inConv = nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3, padding = 1)  # position-wise
+        # 混合嵌入层
+        self.embedding = Embedding(maxlen=seq_len, d_model=d_model, n_segments=3, device = device)
+
+        self.layer_stack = nn.ModuleList([      # 编码器层
+            EncoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+            for _ in range(n_layers)])
+        
+        self.mu_layer = nn.Linear(d_model, d_model) # 一层Linear够吗？
+        self.sigma_layer = nn.Linear(d_model, d_model)
+
+    def forward(self, src_seq, mask=None, return_attns=False):
+        '''
+        :param src_seq: 原始序列，初始为输入的插值序列[B, F, dim]
+        :param mask:
+        :param return_attns:
+        :return: mu, logvar
+        '''
+        n_past = self.n_past
+        n_future = self.n_future
+        n_trans = self.n_trans
+
+        enc_slf_attn_list = []
+        # -- Forward
+        # 输入卷积层
+        src_seq = src_seq.permute(0, 2, 1)  # 注意卷积前后要转维度
+        enc_input = self.inConv(src_seq)    # 输入卷积层 [B, d_model, F]
+        enc_input = enc_input.permute(0, 2, 1)
+        # 混合嵌入
+        enc_output = self.embedding(enc_input, n_past=n_past, n_future=n_future, n_trans=n_trans)
+
+        # EncoderLayer层
+        for enc_layer in self.layer_stack:
+            enc_output, enc_slf_attn = enc_layer(enc_output, slf_attn_mask=mask)
+            if return_attns:
+                enc_slf_attn_list += [enc_slf_attn]   # 注意力分数
+        
+        z = enc_output.mean(dim = 1) # calc mean along T axis
+        mu = self.mu_layer(z)
+        logvar = self.sigma_layer(z)
+
+        return mu, logvar
+
+
+class CVAE_Transformer_Decoder(nn.Module):
+    def __init__(
+            self, device, seq_len=50, input_dim=217,      # seq_len：帧数  每个数据的帧数，一个batch中所有数据均为固定长度帧数，如50帧，25帧，35帧  input_dim：输入模型的数据中每一帧的维度
+            n_layers=8, n_head=8, d_k=64, d_v=64,   # n_layers：编码器层数  n_head：多头注意力头数  d_k:注意力中矩阵Q，K的维度 d_v:注意力中矩阵V的维度
+            d_model=256, d_inner=512, dropout=0.1,  # d_model：卷积层的输出维度  d_inner：FFN隐藏层维度
+            n_past =10, n_future = 10, n_trans = 30):   # 已知的关键帧数量和未知帧数
+
+        super().__init__()
+
+        self.d_model = d_model
+        self.n_past = n_past
+        self.n_future = n_future
+        self.n_trans = n_trans
+
+        # 输入卷积层
+        self.inConv = nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3, padding = 1)  # position-wise
+        # 混合嵌入层
+        self.embedding = Embedding(maxlen=seq_len, d_model=d_model, n_segments=3, device = device)
+
+        seqTransDecoderLayer = nn.TransformerDecoderLayer(d_model=d_model,
+                                                          nhead=n_head,
+                                                          dim_feedforward=d_inner,
+                                                          dropout=dropout)
+        self.seqTransDecoder = nn.TransformerDecoder(seqTransDecoderLayer,
+                                                     num_layers=n_layers)
+        # 输出卷积层
+        self.outConv = nn.Conv1d(in_channels=d_model, out_channels=input_dim, kernel_size=3, padding=1)  # position-wise
+
+    def forward(self, src_seq, z, mask=None, return_attns=False, n_past=None, n_future=None, n_trans=None):
+        '''
+        :param src_seq: 原始序列，初始为输入的插值序列[B, F, dim]
+        :param z: latent variable
+        :param mask:
+        :param return_attns:
+        :return: new motion
+        '''
+        if n_past is None: n_past = self.n_past
+        if n_future is None: n_future = self.n_future
+        if n_trans is None: n_trans = self.n_trans
+
+        # 输入卷积层
+        src_seq = src_seq.permute(0, 2, 1)  # 注意卷积前后要转维度
+        enc_input = self.inConv(src_seq)    # 输入卷积层 [B, d_model, F]
+        enc_input = enc_input.permute(0, 2, 1)
+        # 混合嵌入
+        enc_output = self.embedding(enc_input, n_past=n_past, n_future=n_future, n_trans=n_trans)
+        enc_output = enc_output.permute(1, 0, 2) #BFC->FBC
+       
+        z = z[None, :, :]
+        enc_output = self.seqTransDecoder(tgt=enc_output, memory=z)
+        
+        enc_output = enc_output.permute(1, 2, 0) # FBC -> BCF
+        enc_output = self.outConv(enc_output)
+        enc_output = enc_output.permute(0, 2, 1) # BCF -> BFC
+
+        return enc_output
+
+
+class CVAE_Transformer(nn.Module):
+    def __init__(
+            self, device, seq_len=50, input_dim=217,      # seq_len：帧数  每个数据的帧数，一个batch中所有数据均为固定长度帧数，如50帧，25帧，35帧  input_dim：输入模型的数据中每一帧的维度
+            n_layers=8, n_head=8, d_k=64, d_v=64,   # n_layers：编码器层数  n_head：多头注意力头数  d_k:注意力中矩阵Q，K的维度 d_v:注意力中矩阵V的维度
+            d_model=256, d_inner=512, dropout=0.1,  # d_model：卷积层的输出维度  d_inner：FFN隐藏层维度
+            n_past =10, n_future = 10, n_trans = 30):   # 已知的关键帧数量和未知帧数
+        super().__init__()
+        
+        self.name = 'CVAE'
+        self.device = device
+        self.d_model = d_model
+        self.encoder = CVAE_Transformer_Encoder(device=device, seq_len=seq_len, input_dim=input_dim, n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
+                                                d_model=d_model, d_inner=d_inner, dropout=dropout, n_past=n_past, n_future=n_future, n_trans=n_trans)
+        self.decoder = CVAE_Transformer_Decoder(device=device, seq_len=seq_len, input_dim=input_dim, n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
+                                                d_model=d_model, d_inner=d_inner, dropout=dropout, n_past=n_past, n_future=n_future, n_trans=n_trans)
+    
+    def reparameterize(self, mu, logvar, seed=None):
+        std = torch.exp(logvar / 2)
+
+        if seed is None:
+            eps = std.data.new(std.size()).normal_()
+        else:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(seed)
+            eps = std.data.new(std.size()).normal_(generator=generator)
+
+        z = eps.mul(std).add_(mu)
+        return z
+
+    def compute_kl_loss(self, mu, logvar):
+        loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return loss
+    
+    def forward(self, batch, mask=None, return_attns=False, n_past=None, n_future=None, n_trans=None):
+        '''
+        batch = {'gt':  , 'interpolated': ,}
+        '''
+        mu, logvar = self.encoder(batch['gt'])
+        z = self.reparameterize(mu, logvar)
+        enc_output = self.decoder(batch['interpolated'], z, n_past=n_past, n_future=n_future, n_trans=n_trans)
+
+        return enc_output, self.compute_kl_loss(mu, logvar)
+    
+    def generate(self, batch, mask=None, return_attns=False, n_past=None, n_future=None, n_trans=None):
+        '''
+        batch = {'gt':  , 'interpolated': ,}
+        '''
+        z = torch.randn(batch['interpolated'].shape[0], self.d_model, device=self.device)
+        enc_output = self.decoder(batch['interpolated'], z, n_past=n_past, n_future=n_future, n_trans=n_trans)
 
         return enc_output

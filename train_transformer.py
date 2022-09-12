@@ -17,7 +17,7 @@ import numpy as np
 import yaml
 import time
 import random
-from model import Encoder, Encoder_BiRNN
+from model import CVAE_Transformer, Encoder, Encoder_BiRNN
 # from visdom import Visdom
 import utils.benchmarks as bench
 import utils.utils_func as uf
@@ -95,6 +95,7 @@ def do_batch(batch_i, batch_data, mode):
         loss_quat = 0
         loss_position = 0
         loss_root = 0
+        loss_KL = torch.tensor(0.0)
         positions = batch_data['local_x'] # B, F, J, 3
         rotations = batch_data['local_q']
         global_p_gt = batch_data['X'].cuda()
@@ -118,7 +119,10 @@ def do_batch(batch_i, batch_data, mode):
         target_output = torch.from_numpy(gt_pose).to(device)
 
         # Training
-        output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
+        if model.name == 'CVAE':
+            output, loss_KL = model({'gt':target_output, 'interpolated': input}, n_past=n_past, n_future=n_future, n_trans=n_trans)
+        else: output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
+
         if mode == 'train':
             optimizer.zero_grad()
 
@@ -142,12 +146,6 @@ def do_batch(batch_i, batch_data, mode):
         root_gt = local_p_gt[:, :, 0:3]           # B, F,  3
 
         #----------------------------local data-------------------------------------
-
-        # global_p_gt = skeleton_mocap.forward_kinematics(local_q_gt.detach().cpu(), root_gt.detach().cpu())
-        # global_q_pred, global_p_pred = uf.quat_fk(local_q_pred.detach().cpu().numpy(), local_p_pred_.detach().cpu().numpy(), parents)
-        # global_p_pred = torch.from_numpy(global_p_pred) #error: detach before calc loss
-        # global_p_pred = global_p_pred.to(device)
-
         global_q_pred, global_p_pred = uf.quat_fk_cuda(local_q_pred, local_p_pred_, parents)
         
 
@@ -161,7 +159,8 @@ def do_batch(batch_i, batch_data, mode):
         # 计算损失函数
         loss_total = opt['train']['loss_quat_weight'] * loss_quat + \
                         opt['train']['loss_fk_weight'] * loss_fk + \
-                        opt['train']['loss_position_weight'] * loss_position
+                        opt['train']['loss_position_weight'] * loss_position + \
+                        opt['train']['loss_KL_weight'] * loss_KL
                         # opt['train']['loss_fk_weight'] * loss_fk
 
         # update parameters
@@ -176,6 +175,7 @@ def do_batch(batch_i, batch_data, mode):
         loss_fk = opt['train']['loss_fk_weight'] * loss_fk
         loss_quat = opt['train']['loss_quat_weight'] * loss_quat
         loss_pos = opt['train']['loss_position_weight'] * loss_position
+        loss_KL = opt['train']['loss_KL_weight'] * loss_KL
         # local to global for metrics----------------------------------------
 
         mean = x_mean_n if mode == 'train' else x_mean_n_vld
@@ -190,6 +190,7 @@ def do_batch(batch_i, batch_data, mode):
             "loss_pos": loss_pos.item(),
             "loss_quat": loss_quat.item(),
             "loss_fk": loss_fk.item(),
+            "loss_KL": loss_KL.item(),
             "l2p_error": l2p_error.item(),
             "grad_norm": grad_norm.item()
         }
@@ -199,10 +200,10 @@ import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./config/train_config_BABEL_rm.yaml')
+    parser.add_argument('--config', type=str, default='./config/train_config_BABEL_rm_cvae.yaml')
     parser.add_argument('--shuffle', default=False, action='store_true')
     parser.add_argument('--dataset_mode', type=str, default='rand', choices=['same', 'diff', 'rand', 'select'])
-    parser.add_argument('--model', type=str, default='transformer', choices=['transformer', 'birnn'])
+    parser.add_argument('--model', type=str, default='cvae', choices=['transformer', 'birnn', 'cvae'])
 
     args = parser.parse_args()
     # ===========================================读取配置信息===============================================
@@ -229,7 +230,7 @@ if __name__ == '__main__':
     #==========================初始化Skel和数据========================================
     parents = BABELparents
 
-    lafan_data_train = BABEL(opt['data']['data_dir'], seq_len = opt['model']['seq_length'])
+    lafan_data_train = BABEL(opt['data']['data_dir'], seq_len = opt['model']['seq_length'], motion_type=args.dataset_mode)
     x_mean_n = lafan_data_train.x_mean.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n = lafan_data_train.x_std.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n[0, 0, 0] = torch.tensor([1.,1.,1.], dtype=torch.float32, device=device)
@@ -239,7 +240,7 @@ if __name__ == '__main__':
                                     batch_size=opt['train']['batch_size'], \
                                     shuffle=True, num_workers=opt['data']['num_workers'])
 
-    lafan_data_valid = BABEL(opt['data']['vald_dir'], seq_len = opt['model']['seq_length'])
+    lafan_data_valid = BABEL(opt['data']['vald_dir'], seq_len = opt['model']['seq_length'], motion_type=args.dataset_mode)
     x_mean_n_vld = lafan_data_train.x_mean.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n_vld = lafan_data_train.x_std.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n_vld[0, 0, 0] = torch.tensor([1.,1.,1.], dtype=torch.float32, device=device)
@@ -250,29 +251,43 @@ if __name__ == '__main__':
 
     #===============================初始化模型=======================================
     ## initialize model ##
-    if args.model == 'transformer':
-        model = Encoder(device = device,
-                        seq_len=opt['model']['seq_length'],
-                        input_dim=opt['model']['input_dim'],
-                        n_layers=opt['model']['n_layers'],
-                        n_head=opt['model']['n_head'],
-                        d_k=opt['model']['d_k'],
-                        d_v=opt['model']['d_v'],
-                        d_model=opt['model']['d_model'],
-                        d_inner=opt['model']['d_inner'],
-                        dropout=opt['train']['dropout'],
-                        n_past=opt['model']['n_past'],
-                        n_future=opt['model']['n_future'],
-                        n_trans=opt['model']['n_trans'])
-    else: model = Encoder_BiRNN(device = device)
+    kargs = {
+        'device': device,
+        'seq_len': opt['model']['seq_length'],
+        'input_dim': opt['model']['input_dim'],
+        'n_layers': opt['model']['n_layers'],
+        'n_head': opt['model']['n_head'],
+        'd_k': opt['model']['d_k'],
+        'd_v': opt['model']['d_v'],
+        'd_model': opt['model']['d_model'],
+        'd_inner': opt['model']['d_inner'],
+        'dropout': opt['train']['dropout'],
+        'n_past': opt['model']['n_past'],
+        'n_future': opt['model']['n_future'],
+        'n_trans': opt['model']['n_trans']
+    }
+    modelDict = {
+        'transformer': Encoder,
+        'birnn': Encoder_BiRNN,
+        'cvae': CVAE_Transformer
+    }
+    model = modelDict[args.model](**kargs)
+
     # print(model)
     model.to(device)
-    print('Encoder params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
+    print('Model params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
     
     optimizer = optim.Adam(filter(lambda x: x.requires_grad,  model.parameters()),
                            lr=opt['train']['lr'],)
     scheduler_steplr = StepLR(optimizer, step_size=200, gamma=opt['train']['weight_decay'])
     scheduler_warmup = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=50, after_scheduler=scheduler_steplr)
+
+    epoch_st = 1
+    if opt['test']['load_model']:
+        checkpoint = torch.load(opt['test']['model_dir'])
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        epoch_st = checkpoint['epoch']
 
     #============================================= train ===================================================
 
@@ -280,13 +295,13 @@ if __name__ == '__main__':
     curr_window = opt['model']['n_past'] + opt['model']['n_trans'] + opt['model']['n_future']
     print(f"curr_window: {curr_window}")
     
-    for epoch_i in range(1, opt['train']['num_epoch']+1):  # 每个epoch轮完一遍所有的训练数据
+    for epoch_i in range(epoch_st, opt['train']['num_epoch']+1):  # 每个epoch轮完一遍所有的训练数据
         model.train()
         # scheduler_warmup.step(epoch_i)
         print("epoch: ",epoch_i, "lr: {:.10f} ".format(optimizer.param_groups[0]['lr']))
 
         # 每个batch训练一批数据
-        lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","l2p_error","grad_norm"]
+        lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","loss_KL","l2p_error","grad_norm"]
         losses = {key:[] for key in lossTerms}
         for batch_i, batch_data in tqdm(enumerate(lafan_loader_train)):  # mini_batch
             loss_dic = do_batch(batch_i, batch_data, 'train')
@@ -311,12 +326,15 @@ if __name__ == '__main__':
             else: isBest = False
             print(f"epoch = {epoch_i}, mode = {'valid'}, currentMin = {currentMin}")
             
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch_i
+            }
+            filename = os.path.join(opt['train']['output_dir'], 'latest.pt')
+            torch.save(checkpoint, filename)
+
             if isBest:
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'epoch': epoch_i
-                }
                 filename = os.path.join(opt['train']['output_dir'], f'BestAmong_{opt["train"]["num_epoch"]}.pt')
                 torch.save(checkpoint, filename)
 

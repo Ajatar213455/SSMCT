@@ -14,7 +14,7 @@ import numpy as np
 import yaml
 import time
 import random
-from model import Encoder, Encoder_BiRNN
+from model import Encoder, Encoder_BiRNN, CVAE_Transformer
 # from visdom import Visdom
 import utils.benchmarks as bench
 import utils.utils_func as uf
@@ -73,6 +73,30 @@ def interpolation(X, Q, n_past=10, n_future=10, n_trans = 40):
 
 from tensorboardX import SummaryWriter
 
+def CalcDiffNorm_Rot(jointRot, jointPos, selectedJoint, fps, params):
+    '''
+        jointRot.shape = JT4
+        jointPos.shape = JT3
+        selectedJoint.shape = (J-1)
+        fps = int
+    '''
+    w_rot = np.zeros((jointRot.shape[1]-1, selectedJoint.shape[0], 3), dtype=np.float32)
+    for k in range(jointRot.shape[1]-1):
+        q_nxt = jointRot[selectedJoint, k+1]
+        q_now = jointRot[selectedJoint, k]
+        q_now_inv = geometry.quaternion_invert(q_now)
+
+        delta_q = geometry.quaternion_multiply(q_nxt, q_now_inv).cpu().numpy()
+        delta_q_len = np.linalg.norm(delta_q[:, 1:], axis=-1)
+        delta_q_angle = 2*np.arctan2(delta_q_len, delta_q[:, 0])
+        w_rot[k] = delta_q[:, 1:] * delta_q_angle.reshape(-1,1) * fps
+
+    diffNorm_rot = np.linalg.norm(w_rot[1:]-w_rot[:-1], ord=1, axis=-1).mean()
+    return diffNorm_rot
+
+# def calcAccLoss(q_pred, q_gt):
+
+
 def do_batch(batch_i, batch_data, mode):
     if mode == "train":
         model.train()
@@ -106,16 +130,33 @@ def do_batch(batch_i, batch_data, mode):
         target_output = torch.from_numpy(gt_pose).to(device)
 
         # Training
-        output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
+        loss_KL = torch.tensor(0.0)
+        if model.name == 'CVAE':
+            # output, loss_KL = model({'gt':target_output, 'interpolated': input}, n_past=n_past, n_future=n_future, n_trans=n_trans)
+            outputList = []
+            for i in range(args.nsample):
+                tmp = model.generate({'gt':target_output, 'interpolated': input}, n_past=n_past, n_future=n_future, n_trans=n_trans)
+                outputList.append(tmp[:, None, :, :])
+            output = torch.cat(outputList, dim=1)
+            output = output.reshape(-1, output.shape[2], output.shape[3]) # (B*S, T, C)
+        else: output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
 
         # Results output
         local_q_pred = output[:, :, opt['model']['num_joints']*3:]       # B, F, J*4            局部四元数
+        local_q_gt = target_output[:, :, opt['model']['num_joints']*3:]  # B, F, J*4
         local_p_pred = output[:, :, 0:opt['model']['num_joints']*3]       # B, F, J*3            局部位置坐标
+        local_p_gt = target_output[:, :, 0:opt['model']['num_joints']*3]  # B, F, J*3
 
         #------------------------global or local data-----------------------------------
         local_q_pred = local_q_pred.view(local_q_pred.shape[0], local_q_pred.shape[1], -1, 4)
         local_q_pred_ = local_q_pred / torch.norm(local_q_pred, dim=-1, keepdim=True) #BTJC
         local_p_pred_ = local_p_pred.view(local_p_pred.shape[0], local_p_pred.shape[1], -1, 3)
+        
+        local_q_gt = local_q_gt.view(local_q_gt.size(0), local_q_gt.size(1), -1, 4)  # ground truth rotation and position data
+        local_p_gt_ = local_p_gt.view(local_p_gt.size(0), local_p_gt.size(1), -1, 3)  # B, F, J, 3
+
+        root_pred = local_p_pred[:, :, 0:3]         # B, F, 3   根节点预测值
+        root_gt = local_p_gt[:, :, 0:3]           # B, F,  3
 
         global_q_pred, global_p_pred = uf.quat_fk_cuda(local_q_pred_, local_p_pred_, parents)
 
@@ -125,6 +166,43 @@ def do_batch(batch_i, batch_data, mode):
             global_p_pred = rotation2xyz(local_q_pred_.permute(0,2,3,1), None, **param2xyz)
             global_p_pred = global_p_pred.permute(0,3,1,2)
 
+        loss_dic = {}
+        if mode == 'valid':
+            # loss --------------------------------------
+            # loss_ik += torch.mean(torch.abs(glbl_p_pred_ - glbl_p_gt_) / x_std_n)   # ik运动学损失                                                            # Lik反运动学损失
+            loss_quat = torch.mean(torch.abs(local_q_pred - local_q_gt))       # 旋转四元数损失
+            loss_position = torch.mean(torch.abs(root_pred - root_gt))     # 位移损失
+            loss_fk = torch.mean(torch.abs(global_p_pred - global_p_gt) / x_std_n)
+
+            # 计算损失函数
+            loss_total = opt['train']['loss_quat_weight'] * loss_quat + \
+                            opt['train']['loss_fk_weight'] * loss_fk + \
+                            opt['train']['loss_position_weight'] * loss_position + \
+                            opt['train']['loss_KL_weight'] * loss_KL
+                            # opt['train']['loss_fk_weight'] * loss_fk
+
+            # update parameters
+            loss_fk = opt['train']['loss_fk_weight'] * loss_fk
+            loss_quat = opt['train']['loss_quat_weight'] * loss_quat
+            loss_pos = opt['train']['loss_position_weight'] * loss_position
+            loss_KL = opt['train']['loss_KL_weight'] * loss_KL
+            # local to global for metrics----------------------------------------
+            mean = x_mean_n if mode == 'train' else x_mean_n_vld
+            std = x_std_n if mode == 'train' else x_std_n_vld
+            trans_global_p_pred = (global_p_pred[:, n_past:n_past+n_trans, ...] - mean).detach().cpu().numpy() / std.detach().cpu().numpy()  # Normalization
+            trans_global_p_gt = (global_p_gt[:, n_past:n_past+n_trans, ...] - mean).detach().cpu().numpy() / std.detach().cpu().numpy()
+            # B*T*J*3
+            l2p_error = np.mean(np.sqrt(np.sum((trans_global_p_pred - trans_global_p_gt) ** 2.0, axis=(2, 3))))
+
+            loss_dic = {
+                "loss_total": loss_total.item(),
+                "loss_pos": loss_pos.item(),
+                "loss_quat": loss_quat.item(),
+                "loss_fk": loss_fk.item(),
+                "loss_KL": loss_KL.item(),
+                # "loss_Acc": calcAccLoss(local_q_pred, local_q_gt),
+                "l2p_error": l2p_error.item()
+            }
 
         if mode == "viz":
             fps = 10
@@ -132,32 +210,34 @@ def do_batch(batch_i, batch_data, mode):
             global_p_pred = global_p_pred.permute(0,2,3,1).detach().cpu().numpy()
             assert opt['model']['n_past'] == opt['model']['n_future']
             seedLength = opt['model']['n_past']
-            for i in range(global_p_gt.shape[0]):
-                from copy import deepcopy
-                lastGtPose = global_p_gt[i, :, :, -seedLength]
-                lastGtPose = deepcopy(lastGtPose)
-                # lastGtPose[:, [2,0,1]] = lastGtPose[:, [0,1,2]]
-                savePath = './gifResults_{}'.format(opt['train']['method'])
-                if not os.path.exists(savePath): os.makedirs(savePath)
-                # print("pred_list[i].shape = ", pred_list[i].shape)
-                plot_3d_motion_dico((global_p_pred[i], 60, savePath + '/{}_th_predGT.gif'.format(i), {'pose_rep':'xyz'},
-                    {"title": "gen", "interval": 1000/fps, "labelSeq":None, "seedLength":seedLength, "lastGtPose":lastGtPose, "GT":global_p_gt[i]}))
 
-        loss_dic = {}
+            B, J, C, T = global_p_gt.shape
+            global_p_pred = global_p_pred.reshape(B, -1, J, C, T)
+            savePath = './gifResults_{}'.format(opt['train']['method'])
+            if not os.path.exists(savePath): os.makedirs(savePath)
+
+            for i in range(B):
+                from copy import deepcopy
+                lastGtPose = deepcopy(global_p_gt[i, :, :, -seedLength])
+                allMotions = np.concatenate((global_p_pred[i], global_p_gt[i][None, :, :, :]), axis=0)
+                plot_3d_motion_dico((allMotions, 60, savePath + '/{}_th_predGT.gif'.format(i), {'pose_rep':'xyz'},
+                    {"title": "gen", "interval": 1000/fps, "labelSeq":None, "seedLength":seedLength, "lastGtPose":lastGtPose}))
+
         return loss_dic
 
 import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./config/train-BABEL_large_newmodel.yaml')
+    parser.add_argument('--config', type=str, default='./config/test_config_BABEL_rm_cvae.yaml')
     parser.add_argument('--shuffle', default=False, action='store_true')
     parser.add_argument('--dataset_mode', type=str, default='rand', choices=['same', 'diff', 'rand', 'select'])
     parser.add_argument('--tag', type=str, default=None)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--mode', type=str, default="viz", choices=['viz', 'valid'])
     parser.add_argument('--get_3dpos_method', type=str, default="fk", choices=['fk', 'smpl'])
-    parser.add_argument('--model', type=str, default='transformer', choices=['transformer', 'birnn'])
+    parser.add_argument('--model', type=str, default='cvae', choices=['transformer', 'birnn', 'cvae'])
+    parser.add_argument('--nsample', type=int, default=6)
 
     # parser.add_argument('--name_suffix', type=str, default='default')
     # parser.add_argument('--model_type', type=str, default='uni_dir', choices=['uni_dir', 'bi_dir'])
@@ -171,11 +251,11 @@ if __name__ == '__main__':
     print(stamp)
     # assert 0
     
-    log_dir = opt['train']['log_dir']
-    writer = SummaryWriter(log_dir)
+    # log_dir = opt['train']['log_dir']
+    # writer = SummaryWriter(log_dir)
 
-    output_dir = opt['train']['output_dir']     # 模型输出路径
-    if not os.path.exists(output_dir): os.mkdir(output_dir)
+    # output_dir = opt['train']['output_dir']     # 模型输出路径
+    # if not os.path.exists(output_dir): os.mkdir(output_dir)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -212,21 +292,27 @@ if __name__ == '__main__':
 
     #===============================初始化模型=======================================
     ## initialize model ##
-    if args.model == 'transformer':
-        model = Encoder(device = device,
-                        seq_len=opt['model']['seq_length'],
-                        input_dim=opt['model']['input_dim'],
-                        n_layers=opt['model']['n_layers'],
-                        n_head=opt['model']['n_head'],
-                        d_k=opt['model']['d_k'],
-                        d_v=opt['model']['d_v'],
-                        d_model=opt['model']['d_model'],
-                        d_inner=opt['model']['d_inner'],
-                        dropout=opt['train']['dropout'],
-                        n_past=opt['model']['n_past'],
-                        n_future=opt['model']['n_future'],
-                        n_trans=opt['model']['n_trans'])
-    else: model = Encoder_BiRNN(device = device)
+    kargs = {
+        'device': device,
+        'seq_len': opt['model']['seq_length'],
+        'input_dim': opt['model']['input_dim'],
+        'n_layers': opt['model']['n_layers'],
+        'n_head': opt['model']['n_head'],
+        'd_k': opt['model']['d_k'],
+        'd_v': opt['model']['d_v'],
+        'd_model': opt['model']['d_model'],
+        'd_inner': opt['model']['d_inner'],
+        'dropout': opt['train']['dropout'],
+        'n_past': opt['model']['n_past'],
+        'n_future': opt['model']['n_future'],
+        'n_trans': opt['model']['n_trans']
+    }
+    modelDict = {
+        'transformer': Encoder,
+        'birnn': Encoder_BiRNN,
+        'cvae': CVAE_Transformer
+    }
+    model = modelDict[args.model](**kargs)
     # print(model)
     model.to(device)
     print('Encoder params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
@@ -243,7 +329,7 @@ if __name__ == '__main__':
     print(f"curr_window: {curr_window}")
     for epoch_i in range(1, opt['train']['num_epoch']+1):  # 每个epoch轮完一遍所有的训练数据
         #validate:
-        lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","l2p_error"]
+        lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","loss_KL","l2p_error"]
         losses = {key:[] for key in lossTerms}
         for i_batch, sampled_batch in tqdm(enumerate(lafan_loader_valid)):
             loss_dic = do_batch(i_batch, sampled_batch, args.mode)
