@@ -17,7 +17,7 @@ import numpy as np
 import yaml
 import time
 import random
-from model import Encoder
+from model import Encoder, Encoder_BiRNN
 # from visdom import Visdom
 import utils.benchmarks as bench
 import utils.utils_func as uf
@@ -35,6 +35,8 @@ def RecordBatch(losses, mode, epoch):
         writer.add_scalar(f'{mode}_{key}', val, global_step = epoch)
         losses[key] = format(val, '.3f')
     print(f"epoch = {epoch}, mode = {mode}, losses = {losses}")
+
+    return float(losses['loss_total'])
 
 def flatjoints(x):
     """
@@ -163,8 +165,11 @@ def do_batch(batch_i, batch_data, mode):
                         # opt['train']['loss_fk_weight'] * loss_fk
 
         # update parameters
+        grad_norm = torch.tensor(0.0)
         if mode == 'train':
             loss_total.backward()
+            if args.model == 'birnn':
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), max_norm=100)
             optimizer.step()
 
         # loss_fk = opt['train']['loss_fk_weight'] * loss_fk
@@ -185,14 +190,23 @@ def do_batch(batch_i, batch_data, mode):
             "loss_pos": loss_pos.item(),
             "loss_quat": loss_quat.item(),
             "loss_fk": loss_fk.item(),
-            "l2p_error": l2p_error.item()
+            "l2p_error": l2p_error.item(),
+            "grad_norm": grad_norm.item()
         }
         return loss_dic
 
+import argparse
+
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='./config/train_config_BABEL_rm.yaml')
+    parser.add_argument('--shuffle', default=False, action='store_true')
+    parser.add_argument('--dataset_mode', type=str, default='rand', choices=['same', 'diff', 'rand', 'select'])
+    parser.add_argument('--model', type=str, default='transformer', choices=['transformer', 'birnn'])
+
+    args = parser.parse_args()
     # ===========================================读取配置信息===============================================
-    opt = yaml.load(open('./config/train_config_BABEL_rm.yaml', 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
-    # opt = yaml.load(open('./config/train_config_lafan.yaml', 'r').read())     # 用lafan数据集训练
+    opt = yaml.load(open(args.config, 'r').read(), Loader=yaml.FullLoader)
     stamp = time.strftime("%Y-%m-%d-%H_%M_%S", time.localtime(time.time()))
     print(stamp)
     # assert 0
@@ -220,6 +234,7 @@ if __name__ == '__main__':
     x_std_n = lafan_data_train.x_std.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n[0, 0, 0] = torch.tensor([1.,1.,1.], dtype=torch.float32, device=device)
 
+    # 或许应该考虑drop_last_batch?
     lafan_loader_train = DataLoader(lafan_data_train, \
                                     batch_size=opt['train']['batch_size'], \
                                     shuffle=True, num_workers=opt['data']['num_workers'])
@@ -235,19 +250,21 @@ if __name__ == '__main__':
 
     #===============================初始化模型=======================================
     ## initialize model ##
-    model = Encoder(device = device,
-                    seq_len=opt['model']['seq_length'],
-                    input_dim=opt['model']['input_dim'],
-                    n_layers=opt['model']['n_layers'],
-                    n_head=opt['model']['n_head'],
-                    d_k=opt['model']['d_k'],
-                    d_v=opt['model']['d_v'],
-                    d_model=opt['model']['d_model'],
-                    d_inner=opt['model']['d_inner'],
-                    dropout=opt['train']['dropout'],
-                    n_past=opt['model']['n_past'],
-                    n_future=opt['model']['n_future'],
-                    n_trans=opt['model']['n_trans'])
+    if args.model == 'transformer':
+        model = Encoder(device = device,
+                        seq_len=opt['model']['seq_length'],
+                        input_dim=opt['model']['input_dim'],
+                        n_layers=opt['model']['n_layers'],
+                        n_head=opt['model']['n_head'],
+                        d_k=opt['model']['d_k'],
+                        d_v=opt['model']['d_v'],
+                        d_model=opt['model']['d_model'],
+                        d_inner=opt['model']['d_inner'],
+                        dropout=opt['train']['dropout'],
+                        n_past=opt['model']['n_past'],
+                        n_future=opt['model']['n_future'],
+                        n_trans=opt['model']['n_trans'])
+    else: model = Encoder_BiRNN(device = device)
     # print(model)
     model.to(device)
     print('Encoder params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
@@ -259,15 +276,17 @@ if __name__ == '__main__':
 
     #============================================= train ===================================================
 
+    currentMin = 1e9
     curr_window = opt['model']['n_past'] + opt['model']['n_trans'] + opt['model']['n_future']
     print(f"curr_window: {curr_window}")
+    
     for epoch_i in range(1, opt['train']['num_epoch']+1):  # 每个epoch轮完一遍所有的训练数据
         model.train()
         # scheduler_warmup.step(epoch_i)
         print("epoch: ",epoch_i, "lr: {:.10f} ".format(optimizer.param_groups[0]['lr']))
 
         # 每个batch训练一批数据
-        lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","l2p_error"]
+        lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","l2p_error","grad_norm"]
         losses = {key:[] for key in lossTerms}
         for batch_i, batch_data in tqdm(enumerate(lafan_loader_train)):  # mini_batch
             loss_dic = do_batch(batch_i, batch_data, 'train')
@@ -281,17 +300,24 @@ if __name__ == '__main__':
             #validate:
             losses = {key:[] for key in lossTerms}
             for i_batch, sampled_batch in tqdm(enumerate(lafan_loader_valid)):
-                loss_dic = do_batchloss_dic = do_batch(i_batch, sampled_batch, 'valid')
+                loss_dic = do_batch(i_batch, sampled_batch, 'valid')
                 for key, val in loss_dic.items():
                     losses[key].append(val)
-            RecordBatch(losses, 'valid', epoch_i)
+            nowLossTotal = RecordBatch(losses, 'valid', epoch_i)
+
+            if nowLossTotal < currentMin:
+                currentMin = nowLossTotal
+                isBest = True
+            else: isBest = False
+            print(f"epoch = {epoch_i}, mode = {'valid'}, currentMin = {currentMin}")
             
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch_i
-            }
-            filename = os.path.join(opt['train']['output_dir'], f'epoch_{epoch_i}.pt')
-            torch.save(checkpoint, filename)
+            if isBest:
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'epoch': epoch_i
+                }
+                filename = os.path.join(opt['train']['output_dir'], f'BestAmong_{opt["train"]["num_epoch"]}.pt')
+                torch.save(checkpoint, filename)
 
 

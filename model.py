@@ -195,3 +195,72 @@ class Encoder(nn.Module):
         return enc_output
 
 
+class Encoder_BiRNN(nn.Module):
+    """
+    An encoder model with BiRNN mechanism
+    """
+    def __init__(
+            self, device, seq_len=60, input_dim=168,      # seq_len：帧数  每个数据的帧数，一个batch中所有数据均为固定长度帧数，如50帧，25帧，35帧  input_dim：输入模型的数据中每一帧的维度
+            d_model=256, d_inner=256, dropout=0.1,  # d_model：卷积层的输出维度  d_inner：FFN隐藏层维度
+            n_past = 15, n_future = 15, n_trans = 30, num_layers = 2):   # 已知的关键帧数量和未知帧数
+
+        super().__init__()
+
+        self.device = device
+        self.d_model = d_model
+        self.n_past = n_past
+        self.n_future = n_future
+        self.n_trans = n_trans
+
+        # 输入卷积层
+        self.inConv = nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3, padding = 1)  # position-wise
+        # 混合嵌入层
+        self.embedding = Embedding(maxlen=seq_len, d_model=d_model, n_segments=3, device = device)
+
+        self.hidden_size = d_model
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(d_model, d_inner, num_layers, batch_first=True, bidirectional=True) #input: batch*seq*feature
+        self.fc = nn.Linear(d_inner*2, d_model)  # 2 for bidirection
+
+        # 输出卷积层
+        self.outConv = nn.Conv1d(in_channels=d_model, out_channels=input_dim, kernel_size=3, padding=1)  # position-wise
+
+    def forward(self, src_seq, mask=None, return_attns=False, n_past=None, n_future=None, n_trans=None):
+        '''
+        :param src_seq: 原始序列，初始为输入的插值序列[B, F, dim]
+        :param mask:
+        :param return_attns:
+        :return:
+        '''
+        if n_past is None: n_past = self.n_past
+        if n_future is None: n_future = self.n_future
+        if n_trans is None: n_trans = self.n_trans
+
+        enc_slf_attn_list = []
+        # -- Forward
+        # 输入卷积层
+        src_seq = src_seq.permute(0, 2, 1)  # 注意卷积前后要转维度
+        enc_input = self.inConv(src_seq)    # 输入卷积层 [B, d_model, F]
+        enc_input = enc_input.permute(0, 2, 1)
+        # 混合嵌入
+        enc_output = self.embedding(enc_input, n_past=n_past, n_future=n_future, n_trans=n_trans)
+ 
+        # EncoderLayer层
+        # Set initial states
+        h0 = torch.zeros(self.num_layers*2, enc_output.size(0), self.hidden_size).to(self.device) # 2 for bidirection 
+        c0 = torch.zeros(self.num_layers*2, enc_output.size(0), self.hidden_size).to(self.device)
+        # Forward propagate LSTM
+        # enc_output = enc_output.permute(0, 2, 1) #B*T*C
+        enc_output, _ = self.lstm(enc_output, (h0, c0))  # out: tensor of shape (batch_size, seq_length, hidden_size*2)
+
+        # Decode the hidden state of the last time step
+        B, T, C = enc_output.shape
+        enc_output = self.fc(enc_output.reshape(-1, C)).reshape(B, T, -1)
+        # enc_output = enc_output.permute(0, 2, 1) #B*C*T
+
+        # 输出卷积层
+        enc_output = enc_output.permute(0, 2, 1)  # 注意卷积前后要转维度
+        enc_output = self.outConv(enc_output)    # 输入卷积层 [B, input_dim, F]
+        enc_output = enc_output.permute(0, 2, 1)
+
+        return enc_output

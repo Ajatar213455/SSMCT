@@ -14,7 +14,7 @@ import numpy as np
 import yaml
 import time
 import random
-from model import Encoder
+from model import Encoder, Encoder_BiRNN
 # from visdom import Visdom
 import utils.benchmarks as bench
 import utils.utils_func as uf
@@ -107,8 +107,6 @@ def do_batch(batch_i, batch_data, mode):
 
         # Training
         output = model(input, n_past=n_past, n_future=n_future, n_trans=n_trans)
-        if mode == 'train':
-            optimizer.zero_grad()
 
         # Results output
         local_q_pred = output[:, :, opt['model']['num_joints']*3:]       # B, F, J*4            局部四元数
@@ -139,7 +137,7 @@ def do_batch(batch_i, batch_data, mode):
                 lastGtPose = global_p_gt[i, :, :, -seedLength]
                 lastGtPose = deepcopy(lastGtPose)
                 # lastGtPose[:, [2,0,1]] = lastGtPose[:, [0,1,2]]
-                savePath = './gifResults_{}'.format('transformer')
+                savePath = './gifResults_{}'.format(opt['train']['method'])
                 if not os.path.exists(savePath): os.makedirs(savePath)
                 # print("pred_list[i].shape = ", pred_list[i].shape)
                 plot_3d_motion_dico((global_p_pred[i], 60, savePath + '/{}_th_predGT.gif'.format(i), {'pose_rep':'xyz'},
@@ -154,18 +152,20 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='./config/train-BABEL_large_newmodel.yaml')
     parser.add_argument('--shuffle', default=False, action='store_true')
-    parser.add_argument('--dataset_mode', type=str, default='rand', choices=['same', 'diff', 'rand'])
+    parser.add_argument('--dataset_mode', type=str, default='rand', choices=['same', 'diff', 'rand', 'select'])
     parser.add_argument('--tag', type=str, default=None)
-    parser.add_argument('--seed', type=int, default=10)
+    parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--mode', type=str, default="viz", choices=['viz', 'valid'])
     parser.add_argument('--get_3dpos_method', type=str, default="fk", choices=['fk', 'smpl'])
+    parser.add_argument('--model', type=str, default='transformer', choices=['transformer', 'birnn'])
+
     # parser.add_argument('--name_suffix', type=str, default='default')
     # parser.add_argument('--model_type', type=str, default='uni_dir', choices=['uni_dir', 'bi_dir'])
 
     args = parser.parse_args()
 
     # ===========================================读取配置信息===============================================
-    opt = yaml.load(open('./config/test_config_BABEL_rm.yaml', 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
+    opt = yaml.load(open(args.config, 'r').read(), Loader=yaml.FullLoader)      # 用mocap_bfa, mocap_xia数据集训练
     # opt = yaml.load(open('./config/train_config_lafan.yaml', 'r').read())     # 用lafan数据集训练
     stamp = time.strftime("%Y-%m-%d-%H_%M_%S", time.localtime(time.time()))
     print(stamp)
@@ -178,6 +178,7 @@ if __name__ == '__main__':
     if not os.path.exists(output_dir): os.mkdir(output_dir)
 
     random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if opt['train']['cuda']:
         torch.cuda.manual_seed(args.seed)
@@ -198,32 +199,34 @@ if __name__ == '__main__':
 
     lafan_loader_train = DataLoader(lafan_data_train, \
                                     batch_size=opt['train']['batch_size'], \
-                                    shuffle=True, num_workers=opt['data']['num_workers'])
+                                    shuffle=args.shuffle, num_workers=opt['data']['num_workers'])
 
-    lafan_data_valid = BABEL(opt['data']['vald_dir'], seq_len = opt['model']['seq_length'])
+    lafan_data_valid = BABEL(opt['data']['vald_dir'], seq_len = opt['model']['seq_length'], motion_type = args.dataset_mode)
     x_mean_n_vld = lafan_data_train.x_mean.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n_vld = lafan_data_train.x_std.cuda().view(1, 1, opt['model']['num_joints'], 3)
     x_std_n_vld[0, 0, 0] = torch.tensor([1.,1.,1.], dtype=torch.float32, device=device)
 
     lafan_loader_valid = DataLoader(lafan_data_valid, \
                                     batch_size=opt['train']['batch_size'], \
-                                    shuffle=True, num_workers=opt['data']['num_workers'])
+                                    shuffle=args.shuffle, num_workers=opt['data']['num_workers'])
 
     #===============================初始化模型=======================================
     ## initialize model ##
-    model = Encoder(device = device,
-                    seq_len=opt['model']['seq_length'],
-                    input_dim=opt['model']['input_dim'],
-                    n_layers=opt['model']['n_layers'],
-                    n_head=opt['model']['n_head'],
-                    d_k=opt['model']['d_k'],
-                    d_v=opt['model']['d_v'],
-                    d_model=opt['model']['d_model'],
-                    d_inner=opt['model']['d_inner'],
-                    dropout=opt['train']['dropout'],
-                    n_past=opt['model']['n_past'],
-                    n_future=opt['model']['n_future'],
-                    n_trans=opt['model']['n_trans'])
+    if args.model == 'transformer':
+        model = Encoder(device = device,
+                        seq_len=opt['model']['seq_length'],
+                        input_dim=opt['model']['input_dim'],
+                        n_layers=opt['model']['n_layers'],
+                        n_head=opt['model']['n_head'],
+                        d_k=opt['model']['d_k'],
+                        d_v=opt['model']['d_v'],
+                        d_model=opt['model']['d_model'],
+                        d_inner=opt['model']['d_inner'],
+                        dropout=opt['train']['dropout'],
+                        n_past=opt['model']['n_past'],
+                        n_future=opt['model']['n_future'],
+                        n_trans=opt['model']['n_trans'])
+    else: model = Encoder_BiRNN(device = device)
     # print(model)
     model.to(device)
     print('Encoder params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
@@ -234,11 +237,6 @@ if __name__ == '__main__':
         model.load_state_dict(checkpoint['model'])
         epoch_i = checkpoint['epoch']
 
-    optimizer = optim.Adam(filter(lambda x: x.requires_grad,  model.parameters()),
-                           lr=opt['train']['lr'],)
-    scheduler_steplr = StepLR(optimizer, step_size=200, gamma=opt['train']['weight_decay'])
-    scheduler_warmup = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=50, after_scheduler=scheduler_steplr)
-
     #============================================= train ===================================================
 
     curr_window = opt['model']['n_past'] + opt['model']['n_trans'] + opt['model']['n_future']
@@ -248,7 +246,7 @@ if __name__ == '__main__':
         lossTerms = ["loss_total","loss_pos","loss_quat","loss_fk","l2p_error"]
         losses = {key:[] for key in lossTerms}
         for i_batch, sampled_batch in tqdm(enumerate(lafan_loader_valid)):
-            loss_dic = do_batchloss_dic = do_batch(i_batch, sampled_batch, args.mode)
+            loss_dic = do_batch(i_batch, sampled_batch, args.mode)
             for key, val in loss_dic.items():
                 losses[key].append(val)
             if args.mode == 'viz': break
@@ -256,4 +254,5 @@ if __name__ == '__main__':
         if args.mode == 'viz': break
         RecordBatch(losses, 'valid', epoch_i)
 
+#python viz_transformer.py --model birnn --dataset_mode select --config config/test_config_BABEL_rm_birnn.yaml
 
